@@ -1,0 +1,75 @@
+# Probing from a scheduled job, which is a compromise and worth being precise
+# about.
+#
+# A monitor wants to be a daemon. This is a cron entry, and the cron is a
+# request rather than a promise: it asks for hourly and GitHub delivered 14
+# runs in four days, at intervals of five to nine hours and never at the
+# minute requested. So each visit now probes for fifteen minutes rather than
+# five, which is the only lever this side of the arrangement has.
+#
+# The history is therefore sampled and bursty, not continuous: see the
+# README for the measured numbers rather than the hoped-for ones. The alert
+# engine refuses to judge a window holding fewer than `min_samples` probes,
+# so the thin windows go quiet instead of going wrong.
+#
+# What it buys: the SLO numbers in the report stop being minutes old, and
+# nothing has to be left running on a laptop.
+name: monitor
+
+on:
+  # Run by hand only. The committed targets are examples, and a schedule
+  # that probes somebody else's site every hour is not something to turn on
+  # by default. Put your own services in targets.yaml, then uncomment the
+  # schedule below - seventeen past, not on the hour, because everybody's
+  # cron fires at :00 and GitHub queues scheduled runs behind that spike.
+  #
+  # schedule:
+  #   - cron: "17 * * * *"
+  workflow_dispatch:
+
+# Never two at once: they would write the same SQLite file from two runners
+# and the second would restore a cache the first is about to replace.
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -e .
+
+      # The history has to outlive the runner. A unique key so every run
+      # writes a new entry, and restore-keys so it picks up the newest one
+      # that exists. If the cache is ever evicted the history restarts, which
+      # is a real limitation of doing this here rather than on a host.
+      - name: Restore the history
+        uses: actions/cache@v4
+        with:
+          path: burnrate.db
+          key: burnrate-db-${{ github.run_id }}
+          restore-keys: burnrate-db-
+
+      - name: Probe
+        # Fifteen minutes, not five. The cron says hourly; GitHub has
+        # actually delivered 14 runs in four days - see the README. Visits
+        # are rarer than planned, so each one has to be worth more, and
+        # fifteen ticks is the difference between a window that can be
+        # judged and one that is permanently below min_samples.
+        run: burnrate run --no-metrics --for 900
+
+      - name: Publish the report
+        if: always()
+        run: burnrate report >> "$GITHUB_STEP_SUMMARY"

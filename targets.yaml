@@ -1,0 +1,45 @@
+# Services probed by burnrate.
+#
+# The entries below are examples, pointing at the IANA reserved documentation
+# domains so that a fresh clone runs and produces a report without probing
+# anybody's production site. Replace them with your own.
+#
+# The probe is a single GET on the interval below with a 10-second timeout:
+# at 60 seconds that is roughly 1,440 requests per target per day. Point it
+# only at services you own or have been asked to watch - a monitor aimed at
+# somebody else's site is their call, not yours.
+
+probe:
+  interval_seconds: 60
+  timeout_seconds: 10
+  user_agent: "burnrate/0.1 (+https://github.com/mudassir3817/burnrate)"
+  follow_redirects: true
+
+database: burnrate.db
+metrics_port: 9105
+
+# A window is ignored until it holds this many probes. See README,
+# "Quantisation": at 60s intervals a 5-minute window holds about 5 probes.
+min_samples: 3
+resolve_after: 2
+retention_days: 90
+
+targets:
+  # A static page on a CDN: fast, and expected to stay fast. The latency
+  # objective is tight because there is nothing in the path to be slow.
+  - name: example-static
+    url: https://example.com/
+    slo:
+      availability: 0.99
+      latency_ms: 1500
+      latency_objective: 0.95
+
+  # A looser latency objective against a tighter availability one - the shape
+  # to use when a service is allowed to be slow occasionally but is not
+  # allowed to be down.
+  - name: example-api
+    url: https://example.org/
+    slo:
+      availability: 0.995
+      latency_ms: 3000
+      latency_objective: 0.90

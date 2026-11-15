@@ -1,0 +1,245 @@
+# burnrate
+
+Blackbox SLO monitoring, with the multi-window multi-burn-rate error-budget
+alerting from the Google SRE Workbook.
+
+Probing a URL and shouting when it returns a 500 is a one-afternoon script.
+The hard part of monitoring is the opposite problem: deciding when a signal
+deserves a human. This project is about that decision, and about being honest
+regarding how much a 60-second prober is entitled to conclude.
+
+## What it watches
+
+Whatever is listed in `targets.yaml`. Each target carries its own objectives,
+because a free-tier container and a CDN-hosted static page do not deserve the
+same ones:
+
+```yaml
+targets:
+  - name: example-api
+    url: https://example.org/
+    slo:
+      availability: 0.995      # 99.5% of probes must succeed,
+      latency_ms: 3000         # and 90% of them must come back
+      latency_objective: 0.90  # inside three seconds
+```
+
+The committed targets are examples pointing at the IANA reserved
+documentation domains, so a fresh clone runs and produces a report without
+probing anybody's production site. Probing somebody else's service is their
+call and not the monitor's, which is also why the scheduled workflow ships
+disabled: put your own services in, then turn it on.
+
+## Why one bad probe is not an alert
+
+A container on a free tier sleeps when it is idle. Its first request after a
+quiet spell can take ten seconds and time out, while the next one, with the
+container awake, comes back in a few hundred milliseconds. That gap between a
+cold and a warm request to the same URL is often the single largest
+reliability fact about a service, and it is invisible to anyone who only ever
+clicks the link twice in a row.
+
+A monitor that pages on the first slow probe reports that as an outage every
+time the service has been quiet for an hour, and whoever carries the pager
+learns to ignore it. So nothing here fires on one probe: a window is not
+judged until it holds `min_samples` of them, and an alert needs the burn rate
+to stay above its threshold across a long window and a short one at the same
+time. That restraint is the feature.
+
+## How the alerting works
+
+**The SLIs are ratios, not averages.** Availability is successful probes over
+valid probes. Latency is probes faster than a threshold over valid probes —
+not mean latency, which hides exactly the tail an SLO exists to govern. A
+failed probe is never counted as fast: a connection refused comes back in
+3 ms, and calling that a quick page is how a latency dashboard stays green
+through an outage.
+
+**Burn rate** is how fast error budget is being spent, relative to spending
+exactly all of it over the SLO period:
+
+```
+burn_rate = observed_bad_ratio / error_budget
+```
+
+A 99% availability SLO leaves a 1% budget. Ten percent of probes failing is a
+burn rate of 10: at that pace a month's budget is gone in three days. The SLO
+period does not appear in the formula, which is why the same thresholds work
+regardless of whether the period is 30 days or 7.
+
+**Every rule uses two windows,** a long one and a short one, and fires only
+when both exceed the threshold:
+
+| severity | long window | short window | threshold | burns |
+|---|---|---|---|---|
+| page | 1 h | 5 m | 14.4x | 2% of a 30-day budget in an hour |
+| page | 6 h | 30 m | 6x | 5% in six hours |
+| ticket | 1 d | 2 h | 3x | 10% in a day |
+| ticket | 3 d | 6 h | 1x | 10% in three days |
+
+The long window establishes that the burn is real. The short window
+establishes that it is still happening, so an alert resolves shortly after
+recovery instead of smouldering for the rest of the long window. A page means
+wake someone; a ticket means look at it on Monday.
+
+A consequence worth stating plainly: after an hour-long outage the page
+resolves once traffic is healthy, and the 1-day ticket stays open, because the
+day's budget really is spent. Recovery is not absolution. There is a test
+named after that.
+
+## Quantisation, and what this prober cannot tell you
+
+Burn-rate alerting was designed for high-volume request streams. A 60-second
+blackbox prober is not one. At that interval a 5-minute window holds about
+five samples, so a single failed probe is a 20% bad ratio and a burn rate of
+20 against a 99% SLO — enough to page on one blip.
+
+The guard is a minimum sample count: a window holding fewer than `min_samples`
+probes is suppressed rather than trusted, and the report prints the
+denominator next to every ratio so a 100% figure computed from four probes
+cannot be mistaken for one computed from four thousand.
+
+This does not make the problem disappear, it makes it visible. Three samples
+is still a thin basis for a page, and in the run above the alert fired on
+exactly that. The real fixes are a shorter interval, several probe locations,
+or a service that reports its own request metrics. All three are out of scope
+for something that must run on a laptop with no RAM to spare.
+
+Other things it deliberately does not do: it does not repair anything, so the
+MTTR it reports is time-to-alert-resolution, not time-to-fix. It probes from
+one location, so it cannot separate "the site is down" from "my network is
+down". It is a blackbox: it sees what a visitor sees, and nothing else.
+
+## Running it
+
+```bash
+pip install -e .
+python -m burnrate.cli run                 # probe on a schedule, serve /metrics
+python -m burnrate.cli run --for 300       # the same loop, five minutes of it
+python -m burnrate.cli once                # a single cycle, for cron or CI
+python -m burnrate.cli report -o report.md # SLIs, burn rates, incident timeline
+```
+
+Metrics are exposed on `:9105/metrics` in the Prometheus text format:
+`burnrate_sli_ratio`, `burnrate_burn_rate`, `burnrate_window_samples`,
+`burnrate_alert_open`, `burnrate_target_up`, `burnrate_probe_latency_ms`.
+Every number the alerting decides on is also published, so if the dashboard
+and the alert ever disagree, that is a bug.
+
+Footprint is one Python process and one SQLite file. There is no cluster, no
+message broker and no time-series database, because the machine this was
+written on cannot host any of them.
+
+### Probing from GitHub Actions
+
+`.github/workflows/monitor.yml` runs the loop for five minutes every hour and
+keeps `burnrate.db` in the Actions cache between runs. That is a compromise
+and the README should say so rather than let the badge imply otherwise.
+
+A monitor wants to be a daemon. A cron entry is not one, and it is worth
+being exact about how far short it falls, because the first version of this
+section was wrong.
+
+**What it asks for:** hourly, at `:17`.
+
+**What it got, measured over the first four days:** 14 runs. Intervals of
+five to nine hours, and not one of them at `:17`. GitHub's scheduled
+workflows are best-effort on a quiet public repository, and "best effort"
+turns out to mean roughly three and a half visits a day.
+
+That is the difference between the 120 probes per target per day this
+section used to claim and the **~17 it was actually getting**. The claim was
+arithmetic from the cron line; nobody had looked at the run list.
+
+Each visit now probes for fifteen minutes instead of five, which is the only
+lever available on this side of the arrangement — it cannot make the visits
+more frequent, only worth more when they happen. That takes it to roughly 50
+probes per target per day: still sampled and bursty, and now honestly
+labelled.
+
+The consequences are specific.
+
+- The 1-day / 2-hour ticket windows still fill. Fifty samples a day is
+  enough to say whether a service was up.
+- The 1-hour / 5-minute page windows only ever see samples from inside one
+  visit, and between visits they empty out, fall below `min_samples` and stop
+  being evaluated. With visits six hours apart, the page rule is decorative.
+  The ticket rule is the one that works here.
+- The cache is evictable. Seven days without a hit and the history starts
+  again from nothing.
+
+### A probe from a datacentre is not a probe from a user
+
+On 14 November one of the targets failed **6 out of 6** probes with
+timeouts, having passed 6 out of 6 eight hours earlier. Checked by hand from
+a home connection minutes later it answered HTTP 200 in 234ms, then 141ms.
+
+So the site was almost certainly fine and the runner was almost certainly
+being refused: shared hosts block or throttle datacentre ranges routinely.
+This monitor cannot currently tell "down" from "would not talk to that IP",
+and that limitation belongs in writing rather than in a report that quietly
+accuses a working site of an outage. A run of timeouts from a single vantage
+point is a question, not a verdict — which is the same rule the link checker
+in another project applies to a 403.
+
+Fixing it properly needs a second vantage point, which this does not have.
+
+### The case it does handle: everything failing at once
+
+There is a neighbouring failure that needs no second vantage point to
+diagnose. If *every* target fails before any server speaks — timeout, DNS,
+refused connection, TLS — then either four unrelated providers broke inside
+the same minute, or the one thing those probes share did. The second
+explanation is the ordinary one.
+
+Those cycles are now marked **suspect**. The probes are kept, with their
+error and their timestamp, and excluded from both SLI denominators, because
+a measurement taken through a broken network is not a measurement of the
+service. The report prints how many it set aside, so the judgement is visible
+rather than quietly improving the numbers.
+
+The guard is deliberately easy to clear. One target answering ends it — a 500
+counts, because a server returning 500 proves the request left the machine
+and came back. Below three configured targets it stands down entirely, since
+"all of them failed" with one target is just "it failed", and suppressing
+that would silence the monitor exactly when it is doing its job.
+
+This does nothing for the 14 November case above, where one target failed and
+the rest were fine. That one is still open.
+
+None of that makes the numbers wrong, because the alert engine refuses to
+judge a window holding fewer than `min_samples` probes: thin windows go quiet
+rather than going confidently wrong. It makes them **less sensitive**, which
+is the honest trade for not leaving a process running on a laptop.
+
+## Tests
+
+```bash
+pytest -q     # 84 tests, 0.7s, no network and no sleeping
+```
+
+Time is a parameter everywhere it matters, and the probe layer is exercised
+through a mock transport, so the alerting state machine is tested by handing
+it a history and a timestamp rather than by waiting for one. Failure
+classification is table-driven: DNS, connect, timeout, TLS, redirect loop,
+4xx, 5xx. The redirect-loop class exists because a site can be entirely
+unreachable while every individual hop returns a healthy 301.
+
+## Layout
+
+```
+burnrate/
+  models.py     value types; no I/O
+  config.py     YAML loading, validation, the default rule table
+  prober.py     one request, one verdict, one row
+  storage.py    SQLite, WAL, windowed good/valid counts
+  burn.py       burn-rate arithmetic and rule evaluation
+  alerts.py     open/close state machine, deduplication, flap suppression
+  report.py     SLI tables, latency percentiles, incident timeline
+  metrics.py    Prometheus exposition
+  cli.py        once / run / report
+```
+
+## License
+
+MIT.
